@@ -2,11 +2,5 @@
 
 In this repository we have the final analysis code for the paper :
 
-## Title
-
-Machine learning-based predictive modeling of surgical intervention in glaucoma using systemic data from electronic health records
-
-## Authors
-
-Sally L. Baxter, MD, MSc,Charles Marks, MPH,Tsung-Ting Kuo, PhD, Lucila Ohno-Machado, MD, PhD, Robert N. Weinreb, MD 
+Baxter, S., Marks, C., Kuo, T., Ohno-Machado, L., Weinreb, R., Machine learning-based predictive modeling of surgical intervention in glaucoma using systemic data from electronic health records. American Journal of Ophtalmology. 2019 In Press DOI: 10.1016/j.ajo.2019.07.005
 
