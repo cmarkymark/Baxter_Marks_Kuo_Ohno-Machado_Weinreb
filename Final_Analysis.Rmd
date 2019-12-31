@@ -1,0 +1,588 @@
+---
+title: "BioInfo_KCrossVal_LogReg_Updated"
+author: "Charles Marks"
+date: "February 2019"
+output: html_document
+---
+
+## This Document
+
+The following code was utilized in the production of the manuscript entitled "Machine learning-based predictive modeling of surgical intervention in glaucoma using systemic data from electronic health records" by Sally L. Baxter, MD, MSc, Charles Marks, MPH, Tsung-Ting Kuo, PhD, Lucila Ohno-Machado, MD, PhD, Robert N. Weinreb, MD
+
+## Initializing rMarkdown
+
+Here we set options and upload the libraries necessary for our full analysis.
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(tableone)
+library(PerformanceAnalytics)
+library(psych)
+library(kableExtra)
+library(ROCR)
+library(randomForest)
+library(neuralnet)
+library(nnet)
+options(digits = 10, scipen = 999)
+knitr::opts_chunk$set(warning=FALSE, message=FALSE, error = FALSE)
+```
+
+
+## Loading the Dataset
+
+This dataset was produced from UCSD EHR records.  As a human subjects protection, this dataset is not being made available with the code to analyze.  Concerns and questions should be directed to the corresponding author of the work.
+
+```{r dataset}
+df <- read.csv("Final_Dataset_With_MRN.csv", header=TRUE)
+```
+
+## Exclusion Criteria
+
+So, now we need to exclude people based on certain factors. The three exclusion factors are :
+
+- Not having 6 months of records prior to first surgery date
+- Having less than six months of records data in the system at all
+- Not having any vital records in the system
+
+```{r pressure, echo=FALSE}
+
+
+#this will be our final dataset
+clean_data <- data.frame(matrix(nrow=0,ncol=ncol(df)))
+
+#set the column names to match our full data set
+colnames(clean_data) <- colnames(df) 
+
+#this will contain all patients excluded because they didn't have 6 months of records prior to their first surgery
+surgery_exclude_data <- data.frame(matrix(nrow=0,ncol=ncol(df))) 
+colnames(surgery_exclude_data) <- colnames(df)
+
+#this will contain non-surgery patients with less than six months of data
+newpatient_exclude_data <- data.frame(matrix(nrow=0,ncol=ncol(df)))
+colnames(newpatient_exclude_data) <- colnames(df)
+
+#this will contain all patients with no vital records
+no_vital_data_exclude_data <- data.frame(matrix(nrow=0,ncol=ncol(df))) 
+colnames(no_vital_data_exclude_data) <- colnames(df)
+
+#loop through all patients in the uploaded dataset to check 
+#each of the exclusion criteria 
+for(patient_num in 1:nrow(df))
+{ 
+  #if patient has had surgery and has vital records
+  if(!is.na(df$first_surgery_date[patient_num]) && 
+     !is.na(df$first_vitals_contact_date[patient_num])) 
+  {
+    #check the time difference between first vital contact and first surgery
+    time_test <- difftime(df$first_surgery_date[patient_num], 
+                          df$first_vitals_contact_date[patient_num], units = "days") 
+    #if length is greater than 6 months (ie 180 days), include
+    if(time_test > 180) 
+    {
+      # place in the included data set
+      clean_data <- rbind(clean_data, df[patient_num,])
+      
+    } # else exclude by placing in the surgery exclude table
+    else 
+    {
+      surgery_exclude_data <- rbind(surgery_exclude_data, df[patient_num,])
+    }
+  } #for non-surgery patients with vital records
+  else if(is.na(df$first_surgery_date[patient_num]) && 
+          !is.na(df$first_vitals_contact_date[patient_num])) 
+  {
+    #check if first record for patient in the system occurred prior to 6 months
+    #before the end of September 2018
+    time_test2 <- difftime(as.Date("10/01/2018","%m/%d/%Y"), 
+                           df$first_vitals_contact_date[patient_num], units = "days")
+    #if 6 months or longer, include
+    if(time_test2 > 180)
+    {
+      clean_data <- rbind(clean_data, df[patient_num,])
+    } #if less than 6 months, exclude 
+    else {
+      newpatient_exclude_data <- rbind(newpatient_exclude_data, df[patient_num,])
+    }
+  } #the remaining patients don't have vital records and therefore are excluded
+  else
+  {
+    no_vital_data_exclude_data <- rbind(no_vital_data_exclude_data, df[patient_num,])
+  }
+}
+```
+
+## Table One
+
+Here is the descriptive statistics, stratified by history of glaucoma surgery.  Rows from this can be taken to present a final descriptive table, if so desired. 
+
+```{r tableone}
+tone_vars = colnames(clean_data)
+#the CreateTableOne function didn't like having these columns included
+tone_vars[12] <- NA 
+tone_vars[28] <- NA
+tone <- tableone::CreateTableOne(vars = tone_vars, strata = c("any_glaucoma_surgey") ,data =  clean_data)
+
+# necessary step to make the kableExtra package work, this just makes the output easier
+# to read for internal use
+tone_df <- print(tone, printToggle = FALSE, noSpaces = TRUE)
+
+# prints table one
+kable(tone_df) %>%
+  kable_styling(bootstrap_options = "striped", full_width = F)
+```
+
+## Bivariate Associations
+
+We wanted to look and see if there are bivariate associations between each of our predictor variables and our outcome, so we looped through the table, conducting univariate logistic regressions and reporting he results 
+
+```{r Bivariate, warning=FALSE}
+
+## create a table for bivariate results
+bi.final <- data.frame(matrix(nrow = 0, ncol = 3))
+
+## loop through the columns of the data
+for(i in 3:ncol(clean_data))
+{
+  # gets the variable name for the column
+  iv <- colnames(clean_data)[i]  
+  # we need to check for an error because the column data may not be regressable (ie only one value for the variable for all participants)
+  possibleError <- tryCatch( 
+    #run the model
+    bi.model <- glm (any_glaucoma_surgey ~ get(iv), data = clean_data, family = 
+                       binomial(link="logit")), error = function(e) e
+  )
+  
+  ## if there was no error we will run the following code to add the results to our 
+  ## bi.final table
+  if(!inherits(possibleError, "error")){
+    
+    ## another error check, this step also produced an error at times
+    possibleError2 <- tryCatch(
+      ## convert the coefficient into an OR and compute the confidence interval
+    
+      bi.results <- exp(cbind(OR = coef(bi.model), confint(bi.model))),
+      error = function(e) e) 
+    ## if there was no error above we will add the results to the table of results
+    if(!inherits(possibleError2, "error")){
+      
+        ## add to the final bivariate results
+      rownames(bi.results)[2] <- colnames(clean_data)[i]
+      bi.final <- rbind(bi.final, bi.results)
+    }
+  }
+  
+}
+# this table represents all variables found to be significant and their OR
+bi.signif <- bi.final[which(bi.final$`2.5 %` > 1 | bi.final$`97.5 %`<1),]
+
+##output both tables to view the results
+kable(bi.final) %>%
+  kable_styling(bootstrap_options = "striped", full_width = F)
+
+kable(bi.signif)  %>%
+  kable_styling(bootstrap_options = "striped", full_width = F)
+
+```
+
+
+## Logisitc Regression Leave One Out Cross Validation
+
+So, we are going to run the leave one out cross validation (LOOCV).  We shall utilize a bi-directional stepwise logistic regression function to run the analyses.  Each iteration, the entire dataset (minus one observation) is used to train the model and then that model attempts to predict the outcome of the removed observation.
+
+```{r lofreg LOO}
+
+## this function runs a single fold of the LOOVV
+runfold <- function(train, test)
+{
+  
+  # stepwise regression requires setting the null model
+  model.null = glm(any_glaucoma_surgey ~ 1, 
+                   data=train,
+                   family = binomial(link="logit")
+  )
+  
+  # stepwise regression requires setting the full model with all 48 variables
+  model.full= glm(any_glaucoma_surgey ~ Age + Gender +systolic_max + systolic_min + systolic_mean  + diastolic_max + diastolic_min + diastolic_mean +pulse_min + pulse_max + pulse_mean  +ever_hospitalized + days_hospitalized + CHF + PVD + Stroke + Dementia + Pulmonary + LiverMild + DM + DMcx  + Renal + Cancer + Mets + med_class.Analgesics_._non.opioids + med_class.Analgesics_._opioids  +  med_class.Anti.rheumatic +  med_class.Antianxiety_agents  + med_class.Antiasthmatic + med_class.Anticoagulants + med_class.Anticonvulsant + med_class.Antidepressants + med_class.Antidiabetic + med_class.Antiemetics + med_class.Antihyperlipidemic + med_class.Antihypertensive + med_class.Beta_blockers + med_class.Calcium_blockers + med_class.Corticosteroids + med_class.Cough.Cold + med_class.Decongestants + med_class.Dermatological + med_class.Diuretics + med_class.Laxatives + med_class.Macrolide_antibiotics + med_class.Misc._antiinfectives + med_class.Ophthalmic+med_class.Ulcer_drugs, 
+                  data=train,
+                  family = binomial(link="logit")
+  )
+  
+  # this applies the stepwise model and attempts to predict the results on the training set
+  lr.pr <- predict(model.full, test, type="response") 
+  
+  # return the predicted values and the actual values
+  return(c(lr.pr,test$any_glaucoma_surgey[1]))
+}
+
+# these lists will be population with our predictions and actuals
+predictions <- c()
+actuals <- c()
+
+# this loop will iterate through the entire dataset
+for(i in 1:nrow(clean_data)){
+  
+  # we want to get train and test
+  train <- clean_data[-i,]
+  test <- clean_data[i,]
+  
+  result_fold <- runfold(train,test)
+  
+  predictions <- c(predictions, result_fold[1])
+  actuals <- c(actuals, result_fold[2])
+  
+  # this is just for progress checking
+  print(i)
+  message(i)
+}
+
+
+### Let us make the ROC curve
+pred <- ROCR::prediction(predictions, actuals)
+avg_auc_curve_log_reg <- ROCR::performance(pred,"tpr","fpr")
+plot(avg_auc_curve_log_reg, avg="vertical",main='Average ROC Curve for Logistic Regression',col=2,lwd=2)
+abline(a=0,b=1,lwd=2,lty=2,col='gray')
+
+
+### Save these results for later
+
+lr_predictions <- predictions
+lr_actuals <- actuals
+
+
+```
+
+### Running Stepwise Log Reg
+
+As well, we want to just report the logisitc regression results of the entire data set
+
+```{r full logreg}
+
+## set the null model
+
+model.null = glm(any_glaucoma_surgey ~ 1, 
+                 data=clean_data,
+                 family = binomial(link="logit")
+)
+
+
+# set the full model
+
+model.full= glm(any_glaucoma_surgey ~ Age + Gender +systolic_max + systolic_min + systolic_mean  + diastolic_max + diastolic_min + diastolic_mean +pulse_min + pulse_max + pulse_mean  +ever_hospitalized + days_hospitalized + CHF + PVD + Stroke + Dementia + Pulmonary + LiverMild + DM + DMcx  + Renal + Cancer + Mets + med_class.Analgesics_._non.opioids + med_class.Analgesics_._opioids  +  med_class.Anti.rheumatic +  med_class.Antianxiety_agents  + med_class.Antiasthmatic + med_class.Anticoagulants + med_class.Anticonvulsant + med_class.Antidepressants + med_class.Antidiabetic + med_class.Antiemetics + med_class.Antihyperlipidemic + med_class.Antihypertensive + med_class.Beta_blockers + med_class.Calcium_blockers + med_class.Corticosteroids + med_class.Cough.Cold + med_class.Decongestants + med_class.Dermatological + med_class.Diuretics + med_class.Laxatives + med_class.Macrolide_antibiotics + med_class.Misc._antiinfectives + med_class.Ophthalmic+med_class.Ulcer_drugs, 
+                data=clean_data,
+                family = binomial(link="logit")
+)
+
+# run the stepwise procedure
+
+step.results <- step(model.null,
+                     scope = list(upper=model.full),
+                     direction="both",
+                     test="Chisq",
+                     data=clean_data, trace = 0)
+
+# run the final model
+
+final.model <- eval(step.results$call)
+
+# create a table with the aORs and confidence intervals and p-values
+results <- exp(cbind(OR = coef(final.model), confint(final.model)))
+results <- cbind(results,summary(final.model)$coefficients[,4])
+
+# print out the results
+kable(results) %>%
+  kable_styling(bootstrap_options = "striped", full_width = F)
+
+```
+
+## Random Forests CrossVal
+
+So, we are going to run the LOOCV with random forests.  Here is the code for running this.
+
+```{r rf 25 times}
+
+# this function runs a single fold, training on 80% of the data and testing on the other 20%
+runfold_rf <- function(train, test)
+{
+  ## this code runs the random forests on our 48 variables
+  model.rf = randomForest(any_glaucoma_surgey ~ Age + Gender +systolic_max + systolic_min + systolic_mean  + diastolic_max + diastolic_min + diastolic_mean +pulse_min + pulse_max + pulse_mean  +ever_hospitalized + days_hospitalized + CHF + PVD + Stroke + Dementia + Pulmonary + LiverMild + DM + DMcx  + Renal + Cancer + Mets + med_class.Analgesics_._non.opioids + med_class.Analgesics_._opioids  +  med_class.Anti.rheumatic +  med_class.Antianxiety_agents  + med_class.Antiasthmatic + med_class.Anticoagulants + med_class.Anticonvulsant + med_class.Antidepressants + med_class.Antidiabetic + med_class.Antiemetics + med_class.Antihyperlipidemic + med_class.Antihypertensive + med_class.Beta_blockers + med_class.Calcium_blockers + med_class.Corticosteroids + med_class.Cough.Cold + med_class.Decongestants + med_class.Dermatological + med_class.Diuretics + med_class.Laxatives + med_class.Macrolide_antibiotics + med_class.Misc._antiinfectives + med_class.Ophthalmic + med_class.Ulcer_drugs, 
+                          data=train, importance = TRUE, mtry = 6
+  )
+  
+  # this line uses the random forests model to predict the results of the test data
+  # the predicted values are saved
+  pr <- predict(model.rf, test, type="prob")[,2]
+  
+  # here we return the list of predicted and actuals
+  return(c(pr,test$any_glaucoma_surgey[1]))
+  
+}
+
+# these lists will be population with our predictions and actuals
+predictions <- c()
+actuals <- c()
+
+# this loop will iterate through the entire dataset to runthe LOOCV
+for(i in 1:nrow(clean_data)){
+  
+  # we want to get train and test
+  train <- clean_data[-i,]
+  test <- clean_data[i,]
+  
+  result_fold <- runfold_rf(train,test)
+  
+  predictions <- c(predictions, result_fold[1])
+  actuals <- c(actuals, result_fold[2])
+  
+  # this is just for progress checking
+  print(i)
+  message(i)
+}
+
+### The rest of the code in this chunk is for analysis of the results
+
+### Let us make the average ROC curve
+pred <- ROCR::prediction(predictions, actuals)
+
+### Lets plot the average
+avg_auc_curve_rf <- ROCR::performance(pred,"tpr","fpr")
+plot(avg_auc_curve_rf, avg="vertical",main='Average ROC Curve for Random Forests',col=2,lwd=2)
+abline(a=0,b=1,lwd=2,lty=2,col='gray')
+
+
+## finally we will save the predictions and actuals for later analysis
+
+rf_predictions <- predictions
+rf_actuals <- actuals
+
+
+
+```
+
+### Random Forests Importance Scores
+
+We also want to compute the importance scores for the entire data set
+
+```{r RF Importance }
+
+# run random forests on the full dataset
+
+model.rf = randomForest(any_glaucoma_surgey ~ Age + Gender +systolic_max + systolic_min + systolic_mean  + diastolic_max + diastolic_min + diastolic_mean +pulse_min + pulse_max + pulse_mean  +ever_hospitalized + days_hospitalized + CHF + PVD + Stroke + Dementia + Pulmonary + LiverMild + DM + DMcx  + Renal + Cancer + Mets + med_class.Analgesics_._non.opioids + med_class.Analgesics_._opioids  +  med_class.Anti.rheumatic +  med_class.Antianxiety_agents  + med_class.Antiasthmatic + med_class.Anticoagulants + med_class.Anticonvulsant + med_class.Antidepressants + med_class.Antidiabetic + med_class.Antiemetics + med_class.Antihyperlipidemic + med_class.Antihypertensive + med_class.Beta_blockers + med_class.Calcium_blockers + med_class.Corticosteroids + med_class.Cough.Cold + med_class.Decongestants + med_class.Dermatological + med_class.Diuretics + med_class.Laxatives + med_class.Macrolide_antibiotics + med_class.Misc._antiinfectives + med_class.Ophthalmic + med_class.Ulcer_drugs, 
+                        data=clean_data, importance = TRUE, mtry = 6
+)
+
+# get the results
+results <- importance(model.rf)
+
+# output the results
+kable(results) %>%
+  kable_styling(bootstrap_options = "striped", full_width = F)
+
+```
+
+## ANN CrossVal
+
+### Make Numeric Data Set
+
+To Run ANN you have to use a numeric data set and everything need to be scaled as well
+
+```{r numericize}
+
+#first scale the data
+numeric_data <- clean_data
+# this loop goes through all of the variables and makes the non-numeric data numeric
+for(i in 1:ncol(numeric_data)) 
+{
+  if(!is.numeric(numeric_data[,i]))
+  {
+    numeric_data[,i] <- as.numeric(numeric_data[,i])
+  }
+  
+  
+}
+# these three lines scale all of the data frame
+max <- apply(numeric_data,2,max)
+min <- apply(numeric_data,2,min)
+numeric_data <- as.data.frame(scale(numeric_data, center = min, scale = max - min))
+```
+
+### Run the CrossVal
+
+Like with RF and logistic regression, we will run LOOCV.  We are utilizing an artificial neural network with one hidden layer -- we will also loop through to find the optimal number of nodes for the hidden layer (from 2 to 10).  This code takes a while to execute.  
+
+```{r ANN 25 times}
+
+# this runs one of the five folds
+runfold_ann <- function(train, test, size, decay)
+{
+  # fit the ANN model 
+  model.ann <- nnet(any_glaucoma_surgey ~ Age + Gender +systolic_max + systolic_min + systolic_mean  + diastolic_max + diastolic_min + diastolic_mean +pulse_min + pulse_max + pulse_mean  +ever_hospitalized + days_hospitalized + CHF + PVD + Stroke + Dementia + Pulmonary + LiverMild + DM + DMcx  + Renal + Cancer + Mets + med_class.Analgesics_._non.opioids + med_class.Analgesics_._opioids  +  med_class.Anti.rheumatic +  med_class.Antianxiety_agents  + med_class.Antiasthmatic + med_class.Anticoagulants + med_class.Anticonvulsant + med_class.Antidepressants + med_class.Antidiabetic + med_class.Antiemetics + med_class.Antihyperlipidemic + med_class.Antihypertensive + med_class.Beta_blockers + med_class.Calcium_blockers + med_class.Corticosteroids + med_class.Cough.Cold + med_class.Decongestants + med_class.Dermatological + med_class.Diuretics + med_class.Laxatives + med_class.Macrolide_antibiotics + med_class.Misc._antiinfectives + med_class.Ophthalmic + med_class.Ulcer_drugs, 
+                         data=train, size = size, MaxNWts = 2000, maxit = 1000, entropy = T, decay = decay
+  )
+  
+  # so, this next line, we need a dataframe that only contains the variables included in the model, these numbers represent the columns of the data frame of all the variables contained in the model...it's not pretty but it works 
+  test.cv <- test[,c(3,4,13,14,15,17,18,19,30,31,32,36,37,38,39,40,43,44,45,47,48,50,52,53,55,56,61,63,65,66,67,68,69,72,75,76,87,88,94,95,96,97,101,108,110,115,126,136)]
+ 
+  # predict 
+  prob <- predict(model.ann,test.cv)
+  
+  # save the results of the prediction
+  prob.results <- as.numeric(prob[1,1])
+  
+  # return the predicted values and the actuals
+  return(c(prob.results,test$any_glaucoma_surgey[1]))
+  
+
+}
+
+# these lists will be population with our predictions and actuals
+
+best_size <- 0
+best_decay <- 0
+best_auc <- 0
+best_predictions <- NA
+best_actuals <- NA
+
+# this loop is a bit more complicated than the previous
+for(size in seq(from = 2, to = 10, by = 1)){
+  for(decay in 0:0){
+    predictions <- c()
+    actuals <- c()
+    for(i in 1:nrow(numeric_data)){
+      
+      # we want to get train and test
+      train <- numeric_data[-i,]
+      test <- numeric_data[i,]
+      
+      result_fold <- runfold_ann(train,test, size, 10^(-1*decay))
+      
+      predictions <- c(predictions, result_fold[1])
+      actuals <- c(actuals, result_fold[2])
+      
+      # this is just for progress checking
+      print(i)
+      message(i)
+    }
+    pred <- ROCR::prediction(predictions, actuals)
+    test_auc <- ROCR::performance(pred,"auc")@y.values[[1]][1]
+      
+    if(test_auc > best_auc){
+       best_auc <- test_auc
+       best_size <- size
+       best_decay <- decay
+       best_actuals <- actuals
+       best_predictions <- predictions
+    }
+  }
+}
+
+predictions <- best_predictions
+actuals <- best_actuals
+
+
+### Let us make the average ROC curve
+pred <- ROCR::prediction(predictions, actuals)
+
+### Lets plot the average
+avg_auc_curve_ann <- ROCR::performance(pred,"tpr","fpr")
+ROCR::plot(avg_auc_curve_ann, avg="vertical",main='Average ROC Curve for ANN',col=2,lwd=2)
+abline(a=0,b=1,lwd=2,lty=2,col='gray')
+
+## finally we will save the predicteds and actuals for later
+
+ann_predictions <- predictions
+ann_actuals <- actuals
+
+
+```
+
+### Print Average AUC Curves Together
+
+We wanted to print the average AUC curvers all together, here is the code for doing that
+
+```{r average AUCs}
+ROCR::plot(avg_auc_curve_ann, avg="vertical",main='Average ROC Curves', lwd = 2, pch = 0)
+ROCR::plot(avg_auc_curve_rf, avg="vertical",add = TRUE,lwd=2, pch = 8, lty = "dotted")
+ROCR::plot(avg_auc_curve_log_reg, avg="vertical",add = TRUE,lwd=2, pch = 6, lty = "twodash")
+
+abline(a=0,b=1,lwd=2,lty=2,col='gray')
+legend(0,1, legend=c("Logistic Regression", "Random Forests", "Artificial Neural Network"),  lty=c('twodash','dotted','solid'), lwd =2, cex=0.8)
+```
+
+### CutPoint 
+
+We also want to compute the specificity, sensitivity and accuracy of the model.  We used the oc_youden_kernel in the cutpointr function in order to identify this point.
+
+```{r cutpoint}
+
+## for finding cutpoint
+library(cutpointr)
+
+
+### Logisitic Regression
+
+
+  cp <- cutpointr(x = lr_predictions, class = lr_actuals, method = oc_youden_kernel)
+  
+  sum_cp <-summary(cp)$cutpointr[[1]]
+  
+  lr_sensitivity <- sum_cp$sensitivity
+  lr_specificity <- sum_cp$specificity
+  lr_cutpoint <- sum_cp$optimal_cutpoint
+  lr_accuracy <- sum_cp$acc
+  lr_youden <- sum_cp$sensitivity + sum_cp$specificity - 1
+
+
+
+
+
+## Random Forests
+
+  cp <- cutpointr(x = rf_predictions, class = rf_actuals, method = oc_youden_kernel)
+  
+  sum_cp <-summary(cp)$cutpointr[[1]]
+  
+  rf_sensitivity <- sum_cp$sensitivity
+  rf_specificity <- sum_cp$specificity
+  rf_cutpoint <- sum_cp$optimal_cutpoint
+  rf_accuracy <- sum_cp$acc
+  rf_youden <- sum_cp$sensitivity + sum_cp$specificity - 1
+### ANN
+
+  cp <- cutpointr(x = ann_predictions, class = ann_actuals, method = oc_youden_kernel)
+  
+  sum_cp <-summary(cp)$cutpointr[[1]]
+  
+  ann_sensitivity <- sum_cp$sensitivity
+  ann_specificity <- sum_cp$specificity
+  ann_cutpoint <- sum_cp$optimal_cutpoint
+  ann_accuracy <- sum_cp$acc
+  ann_youden <- sum_cp$sensitivity + sum_cp$specificity - 1
+  
+## create the final table
+models <- c("Logistic Regression", "Random Forest", "Artificial Neural Network")
+sensitivitys <- c(lr_sensitivity,rf_sensitivity, ann_sensitivity)
+
+specificitys <- c(lr_specificity,rf_specificity, ann_specificity)
+
+accuracys <- c(lr_accuracy,rf_accuracy, ann_accuracy)
+
+cutpoints <- c(lr_cutpoint,rf_cutpoint, ann_cutpoint )
+
+youdens <- c(lr_youden, rf_youden, ann_youden)
+
+
+table <- data.frame(matrix(nrow = 3, ncol = 0))
+table$model <- models
+table$sensitivity <- round(sensitivitys, digits = 3)
+table$specificity <- round(specificitys, digits = 3)
+table$accuracy <- round(accuracys, digits = 3)
+table$cutpoint <- round(cutpoints, digits = 3)
+table$youden <- round(youdens, digits = 3)
+
+
+## print it all out
+kable(table) %>%
+  kable_styling(bootstrap_options = "striped", full_width = F)
+
+```
+
